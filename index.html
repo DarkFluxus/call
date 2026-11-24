@@ -153,7 +153,7 @@ const hex=n=>[...crypto.getRandomValues(new Uint8Array(n))].map(b=>b.toString(16
 const ID=hex(8),TOK=hex(16); // ID é público (os outros veem); TOK é segredo e prova que o ID é seu
 const clean=s=>s.toUpperCase().replace(/[^A-Z0-9]/g,'').slice(0,10);
 const md=navigator.mediaDevices;
-let room,name,mic,micOn=false,screen,ice=[],ctx,unread=0,pq=Promise.resolve(),cfg={};
+let room,name,mic,micOn=false,screen,ice=[],hasTurn=false,ctx,unread=0,pq=Promise.resolve(),cfg={};
 let rep=null,mix,up=Promise.resolve();
 const peers=new Map(),meters=new Map(),msgs=new Map();
 const qs=()=>'room='+room+'&id='+ID+'&k='+TOK;
@@ -162,7 +162,7 @@ const qs=()=>'room='+room+'&id='+ID+'&k='+TOK;
 try{$('#name').value=localStorage.rn||''}catch(e){}
 if(!window.isSecureContext||!md)$('#warn').hidden=false;
 if(!md||!md.getDisplayMedia){$('#share').hidden=true;$('#qual').hidden=true}
-fetch('/config').then(r=>r.json()).then(c=>{cfg=c;ice=c.ice;if(c.pass)$('#pass').hidden=false}).catch(()=>{});
+fetch('/config').then(r=>r.json()).then(c=>{cfg=c;if(c.pass)$('#pass').hidden=false}).catch(()=>{});
 const showErr=t=>{$('#err').textContent=t;$('#err').hidden=!t};
 const h0=clean(location.hash.slice(1));
 if(h0.length>=4){$('#code').value=h0;$('#join').focus()}
@@ -198,6 +198,10 @@ async function enter(){
   if(d.full)return{err:'Sala cheia (máximo de 8 pessoas).'};
   return{d};
 }
+async function getIce(){ // servidores STUN/TURN: só quem já entrou na sala recebe
+  try{const d=await(await fetch('/ice?'+qs())).json();ice=d.ice;hasTurn=!!d.turn}
+  catch(e){ice=[{urls:'stun:stun.l.google.com:19302'}]}
+}
 async function join(code){
   room=code;
   const typed=$('#name').value.trim();
@@ -206,6 +210,7 @@ async function join(code){
   initAudio();
   const e=await enter();
   if(e.err)return showErr(e.err);
+  await getIce();
   $('#home').hidden=true;$('#room').hidden=false;$('#rc').textContent=code;
   history.replaceState(null,'','#'+code);
   micUI();clipUI();people();hint();
@@ -234,7 +239,7 @@ async function connect(first){ // long-polling: funciona em qualquer túnel
         const e=await enter();
         if(e.retry)throw new Error('rede');
         if(e.err){alert(e.err);location.href=location.pathname;return}
-        [...peers.keys()].forEach(i=>drop(i));e.d.peers.forEach(p=>peer(p.id,p.name));people();joined=true;
+        await getIce();[...peers.keys()].forEach(i=>drop(i));e.d.peers.forEach(p=>peer(p.id,p.name));people();joined=true;
         if(screen)post({t:'share',on:true});
       }
       const r=await fetch('/poll?'+qs(),{cache:'no-store'});
@@ -253,7 +258,7 @@ function peer(id,nm){
   const p={id,name:nm||'?',pc,polite:ID<id,making:false,ignore:false,q:Promise.resolve(),streams:new Map(),sharing:undefined};
   peers.set(id,p);
   pc.onnegotiationneeded=async()=>{
-    try{p.making=true;await pc.setLocalDescription();tx(id,{sdp:pc.localDescription});tune(pc)}
+    try{p.making=true;await pc.setLocalDescription();tx(id,{sdp:pc.localDescription});tune(pc);watch(p)}
     catch(e){console.warn(e)}finally{p.making=false}
   };
   pc.onicecandidate=e=>{if(e.candidate)tx(id,{ice:e.candidate})};
@@ -268,6 +273,13 @@ function peer(id,nm){
   retune();
   return p;
 }
+function watch(p){ // se em 15s a conexão direta não fecha, avisa em vez de falhar calado
+  if(p.w)return;
+  p.w=setTimeout(()=>{
+    const s=p.pc.iceConnectionState;
+    if(s!=='connected'&&s!=='completed')sys('⚠ Sem conexão direta com '+p.name+'. '+(hasTurn?'Tentando pelo servidor de relay…':'Provavelmente a rede dele(a) é 4G/restrita: sem servidor TURN, tela e voz não passam (o chat continua).'));
+  },15000);
+}
 function signal(from,d){
   const p=peers.get(from);if(!p)return;
   p.q=p.q.then(()=>handle(p,d)).catch(e=>console.warn('sinal',e));
@@ -280,14 +292,14 @@ async function handle(p,d){
     p.ignore=!p.polite&&clash;
     if(p.ignore)return;
     await pc.setRemoteDescription(d.sdp);
-    if(offer){await pc.setLocalDescription();tx(p.id,{sdp:pc.localDescription});tune(pc)}
+    if(offer){await pc.setLocalDescription();tx(p.id,{sdp:pc.localDescription});tune(pc);watch(p)}
   }else if(d.ice){
     try{await pc.addIceCandidate(d.ice)}catch(e){if(!p.ignore)throw e}
   }
 }
 function drop(id){
   const p=peers.get(id);if(!p)return;
-  p.pc.close();(p.mn||[]).forEach(n=>n&&n.disconnect());
+  clearTimeout(p.w);p.pc.close();(p.mn||[]).forEach(n=>n&&n.disconnect());
   p.streams.forEach(s=>{s.el.srcObject=null;s.tile.remove()});
   peers.delete(id);meters.delete(id);retune();hint();clipSync();
 }
@@ -342,8 +354,19 @@ function track(p,e){
   e.track.onunmute=e.track.onended=()=>sync(p,s);
   if(e.track.kind==='audio')(p.mn=p.mn||[]).push(mixIn(e.track));
   sync(p,s);
-  s.el.play().catch(()=>{});
+  play(s);
 }
+function play(s){ // alguns celulares barram autoplay com som: toca mudo e libera o som no primeiro toque
+  s.el.play().catch(()=>{
+    s.el.muted=true;s.forced=true;
+    s.el.play().catch(()=>{});
+    if(!play.said){play.said=1;sys('Toque na tela uma vez pra liberar o som e a imagem.')}
+  });
+}
+addEventListener('pointerdown',()=>{
+  peers.forEach(p=>p.streams.forEach(s=>{if(s.forced){s.forced=false;s.el.muted=false}if(s.el.paused)s.el.play().catch(()=>{})}));
+  if(ctx&&ctx.state==='suspended')ctx.resume();
+},true);
 function sync(p,s){
   const vt=s.st.getVideoTracks();
   s.tile.hidden=p.sharing===false||!vt.some(t=>t.readyState==='live'); // aparece assim que chega a faixa, sem esperar o 1º quadro
@@ -521,23 +544,36 @@ function fileEl(f){
   return w;
 }
 $('#lb').onclick=()=>{$('#lb').hidden=true};
-function upload(f,mid,re,pg){
-  return new Promise(done=>{
+const CHUNK=8*1048576; // pedaços de 8 MB: passam por qualquer túnel/proxy e dá pra repetir só o pedaço que falhou
+function part(f,up,i,parts,mid,re,onp){
+  return new Promise(res=>{
     const x=new XMLHttpRequest();
-    x.open('POST','/upload?'+qs()+'&name='+encodeURIComponent(f.name)+'&type='+encodeURIComponent(f.type||'')+'&mid='+mid+(re?'&re='+encodeURIComponent(JSON.stringify(re)):''));
-    x.upload.onprogress=e=>{if(e.lengthComputable)pg.textContent='Enviando… '+Math.round(100*e.loaded/e.total)+'%'};
-    x.onload=()=>{
-      if(x.status===200)pg.remove();
-      else pg.textContent=x.status===413?'Não enviou: arquivo grande demais ou sala cheia de arquivos.':x.status===429?'Não enviou: muitos envios seguidos, espera um pouco.':'Falhou o envio ('+x.status+').';
-      done();
-    };
-    x.onerror=x.ontimeout=()=>{pg.textContent='Falhou o envio (conexão).';done()};
-    x.send(f);
+    x.open('POST','/upload?'+qs()+'&up='+up+'&part='+i+'&parts='+parts+'&size='+f.size+'&name='+encodeURIComponent(f.name)+'&type='+encodeURIComponent(f.type||'')+'&mid='+mid+(re?'&re='+encodeURIComponent(JSON.stringify(re)):''));
+    x.upload.onprogress=e=>{if(e.lengthComputable)onp(i*CHUNK+e.loaded)};
+    x.onload=()=>{let d={};try{d=JSON.parse(x.responseText)}catch(e){}res({s:x.status,d})};
+    x.onerror=x.ontimeout=()=>res({s:0,d:{}});
+    x.send(f.slice(i*CHUNK,(i+1)*CHUNK));
   });
+}
+async function upload(f,mid,re,pg){
+  const up=hex(12),parts=Math.max(1,Math.ceil(f.size/CHUNK));
+  const onp=b=>{pg.textContent='Enviando… '+Math.min(99,Math.round(100*b/f.size))+'%'};
+  for(let i=0;i<parts;i++){
+    let r,ok=false;
+    for(let t=0;t<5&&!ok;t++){
+      r=await part(f,up,i,parts,mid,re,onp);
+      ok=r.s===200||(r.s===409&&r.d.next>i); // 409 com next>i = o servidor já tinha recebido esse pedaço
+      if(!ok&&(r.s===0||r.s===429||r.s>=500))await new Promise(z=>setTimeout(z,1500*(t+1)));
+      else if(!ok)break;
+    }
+    if(!ok){pg.textContent=r.s===413?'Não enviou: arquivo grande demais ou sala cheia de arquivos.':r.s===429?'Não enviou: muitos envios seguidos, espera um pouco.':'Falhou o envio ('+(r.s||'conexão')+').';return}
+  }
+  pg.remove();
 }
 function sendFiles(list){
   const re=rep,max=cfg.maxFile||5e7;
   for(const f of list){
+    if(!f.size){sys(f.name+': arquivo vazio.');continue}
     if(f.size>max){sys(f.name+': passa de '+Math.round(max/1048576)+' MB.');continue}
     const mid=hex(4),d=addMsg('Você','','me',{id:mid,re,file:{name:f.name,size:f.size,mime:f.type,url:URL.createObjectURL(f)}});
     msgs.get(mid).text='📎 '+f.name;

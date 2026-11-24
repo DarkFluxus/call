@@ -7,14 +7,15 @@
 //   PORT=3000           porta (hospedagem define sozinha)
 //   HOST=127.0.0.1      onde escuta (padrão: só local; vira 0.0.0.0 se a hospedagem definir PORT)
 //   TRUST_PROXY=1       confia no X-Forwarded-For (use em Render/Railway/Fly etc.)
-//   MAX_FILE_MB=50      tamanho máximo de arquivo     ROOM_QUOTA_MB=300  limite de arquivos por sala
-//   TURN_URL / TURN_USER / TURN_PASS   servidor TURN (ajuda quem está em 4G/CGNAT)
+//   MAX_FILE_MB=200     tamanho máximo de arquivo     ROOM_QUOTA_MB=500  limite por sala    GLOBAL_QUOTA_MB=1500  limite do servidor todo
+//   CF_TURN_KEY_ID / CF_TURN_TOKEN     TURN grátis da Cloudflare (faz tela/voz funcionar pra quem está em 4G ou rede restrita)
+//   TURN_URL / TURN_USER / TURN_PASS   ou qualquer outro servidor TURN
 const http = require('http'), fs = require('fs'), path = require('path'), os = require('os'), zlib = require('zlib'), crypto = require('crypto');
 const PORT = +process.env.PORT || 3000;
 const HOST = process.env.HOST || (process.env.PORT ? '0.0.0.0' : '127.0.0.1');
 const SENHA = process.env.SENHA || '', TRUST = process.env.TRUST_PROXY === '1';
 const MAX = 8, POLL_MS = 25000, GONE_MS = 40000, EMPTY_MS = 15 * 60000, MAX_ROOMS = 60, MAX_CLIENTS = 300;
-const MAX_FILE = (+process.env.MAX_FILE_MB || 50) * 1048576, QUOTA = (+process.env.ROOM_QUOTA_MB || 300) * 1048576;
+const MAX_FILE = (+process.env.MAX_FILE_MB || 200) * 1048576, QUOTA = (+process.env.ROOM_QUOTA_MB || 500) * 1048576, GLOBAL = (+process.env.GLOBAL_QUOTA_MB || 1500) * 1048576, CHUNK_MAX = 16 * 1048576;
 const HTML = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');
 const DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'resenha-'));
 const KEY = crypto.randomBytes(32);
@@ -95,16 +96,31 @@ const remove = (r, id) => {
   others(r, id, 'leave', { id });
   if (!r.peers.size) r.empty = Date.now();
 };
-const dropRoom = code => { const r = rooms.get(code); if (!r) return; r.files.forEach(f => fs.unlink(f.p, () => {})); rooms.delete(code); };
+const dropRoom = code => { const r = rooms.get(code); if (!r) return; r.files.forEach(f => fs.unlink(f.p, () => {})); r.ups.forEach(u => fs.unlink(u.fp, () => {})); rooms.delete(code); };
 const auth = (room, id, k) => { // só quem tem o token secreto do cliente passa
   const r = rooms.get(room), c = r && r.peers.get(id);
   return c && TOK.test(k) && crypto.timingSafeEqual(c.th, sha(k)) ? { r, c } : null;
 };
-const iceServers = () => {
-  const s = [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }];
-  if (process.env.TURN_URL) s.push({ urls: process.env.TURN_URL.split(','), username: process.env.TURN_USER || '', credential: process.env.TURN_PASS || '' });
-  return s;
-};
+const STUN = [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302', 'stun:stun.cloudflare.com:3478'] }];
+let turnC = { t: 0, list: [] };
+async function turnList() {
+  const out = [];
+  if (process.env.TURN_URL) out.push({ urls: process.env.TURN_URL.split(','), username: process.env.TURN_USER || '', credential: process.env.TURN_PASS || '' });
+  const kid = process.env.CF_TURN_KEY_ID, tok = process.env.CF_TURN_TOKEN;
+  if (kid && tok) {
+    if (Date.now() - turnC.t > 3600e3) { // credencial da Cloudflare dura 24h; renova a cada 1h
+      try {
+        const r = await fetch('https://rtc.live.cloudflare.com/v1/turn/keys/' + encodeURIComponent(kid) + '/credentials/generate-ice-servers', {
+          method: 'POST', headers: { Authorization: 'Bearer ' + tok, 'Content-Type': 'application/json' }, body: JSON.stringify({ ttl: 86400 }), signal: AbortSignal.timeout(8000) });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        const d = await r.json(), is = d.iceServers;
+        turnC = { t: Date.now(), list: (Array.isArray(is) ? is : is ? [is] : []).filter(x => x && x.urls) };
+      } catch (e) { console.error('TURN da Cloudflare falhou:', e.message); turnC.t = Date.now() - 3000e3; } // tenta de novo em ~10 min
+    }
+    out.push(...turnC.list);
+  }
+  return out;
+}
 const small = (o, n) => String(o || '').slice(0, n);
 
 /* ---------- servidor ---------- */
@@ -129,7 +145,7 @@ const server = http.createServer({ maxHeaderSize: 8192 }, (req, res) => {
         'Content-Security-Policy': `default-src 'none'; script-src 'nonce-${n}'; style-src 'nonce-${n}'; img-src 'self' blob:; media-src 'self' blob:; connect-src 'self'; manifest-src 'self'; worker-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'` });
       return res.end(HTML.split('__N__').join(n));
     }
-    if (p === '/config') return json(res, 200, { ice: iceServers(), pass: !!SENHA, maxFile: MAX_FILE });
+    if (p === '/config') return json(res, 200, { pass: !!SENHA, maxFile: MAX_FILE });
     if (p === '/manifest.webmanifest') { res.writeHead(200, { 'Content-Type': 'application/manifest+json', 'Cache-Control': 'public, max-age=3600' }); return res.end(MANIFEST); }
     if (p === '/sw.js') { res.writeHead(200, { 'Content-Type': 'application/javascript; charset=utf-8', 'Cache-Control': 'no-cache' }); return res.end(SW); }
     if (p === '/icon-192.png' || p === '/icon-512.png' || p === '/apple-touch-icon.png') {
@@ -145,7 +161,7 @@ const server = http.createServer({ maxHeaderSize: 8192 }, (req, res) => {
     if (SENHA && !same(h['x-senha'] || '', SENHA)) { strike(ip); return json(res, 403, { error: 'senha' }); }
     if (rooms.size >= MAX_ROOMS) return json(res, 503, { error: 'lotado' });
     let c; do c = newCode(); while (rooms.has(c));
-    rooms.set(c, { peers: new Map(), files: new Map(), bytes: 0, empty: Date.now() });
+    rooms.set(c, { peers: new Map(), files: new Map(), ups: new Map(), bytes: 0, empty: Date.now() });
     return json(res, 200, { room: c });
   }
 
@@ -199,6 +215,10 @@ const server = http.createServer({ maxHeaderSize: 8192 }, (req, res) => {
   if (!a) return end(res, 404); // sala/cliente desconhecido ou token errado: o cliente tenta entrar de novo
   const { r, c } = a;
 
+  if (m === 'GET' && p === '/ice') { // credenciais TURN só pra quem já está na sala
+    return turnList().then(t => json(res, 200, { ice: [...STUN, ...t], turn: t.length > 0 }));
+  }
+
   if (m === 'GET' && p === '/poll') {
     const n = conns.get(ip) || 0;
     if (n >= 30) return end(res, 429);
@@ -239,30 +259,45 @@ const server = http.createServer({ maxHeaderSize: 8192 }, (req, res) => {
     return;
   }
 
-  if (m === 'POST' && p === '/upload') {
-    if (hit(ip, 'up', 20, 60000)) return json(res, 429, { error: 'devagar' });
-    const len = +h['content-length'];
-    if (!(len > 0)) return json(res, 411, { error: 'sem tamanho' });
-    if (len > MAX_FILE) { res.writeHead(413, { 'Connection': 'close', 'Content-Type': 'application/json' }); return res.end('{"error":"grande"}'); }
-    if (r.bytes + len > QUOTA) { res.writeHead(413, { 'Connection': 'close', 'Content-Type': 'application/json' }); return res.end('{"error":"cota"}'); }
-    r.bytes += len;
-    const fid = crypto.randomBytes(12).toString('hex'), fp = path.join(DIR, fid);
-    const ws = fs.createWriteStream(fp, { flags: 'wx', mode: 0o600 });
+  if (m === 'POST' && p === '/upload') { // arquivo grande vai em pedaços de ~8 MB (proxies/túneis cortam pedidos grandes)
+    if (hit(ip, 'up', 150, 60000)) return json(res, 429, { error: 'devagar' });
+    const upid = q.get('up') || '', part = +q.get('part'), parts = +q.get('parts'), total = +q.get('size'), len = +h['content-length'];
+    if (!FID.test(upid) || !Number.isInteger(part) || !Number.isInteger(parts) || part < 0 || parts < 1 || parts > 400 || part >= parts) return json(res, 400, { error: 'pedido' });
+    if (!(total > 0) || total > MAX_FILE) { res.writeHead(413, { 'Connection': 'close', 'Content-Type': 'application/json' }); return res.end('{"error":"grande"}'); }
+    if (!(len > 0) || len > CHUNK_MAX) return json(res, 400, { error: 'pedaço' });
+    let u = r.ups.get(upid);
+    if (!u) {
+      if (part !== 0 || r.files.has(upid)) return json(res, 404, { error: 'sessão' });
+      let g = 0; rooms.forEach(x => g += x.bytes);
+      if (r.bytes + total > QUOTA || g + total > GLOBAL) { res.writeHead(413, { 'Connection': 'close', 'Content-Type': 'application/json' }); return res.end('{"error":"cota"}'); }
+      r.bytes += total;
+      u = { by: id, total, got: 0, next: 0, fp: path.join(DIR, room + '-' + upid), t: Date.now(), busy: false };
+      r.ups.set(upid, u);
+    } else if (u.by !== id) return json(res, 404, { error: 'sessão' });
+    if (u.busy || part !== u.next) return json(res, 409, { error: 'ordem', next: u.next });
+    if (u.got + len > u.total) return json(res, 400, { error: 'tamanho' });
+    u.busy = true;
+    const ws = fs.createWriteStream(u.fp, { flags: 'a', mode: 0o600 });
     let n = 0, dead = false;
-    const die = (code, e) => { if (dead) return; dead = true; r.bytes -= len; ws.destroy(); fs.unlink(fp, () => {}); if (!res.headersSent) json(res, code, { error: e }); };
+    const die = (code, e) => { if (dead) return; dead = true; u.busy = false; ws.once('close', () => fs.truncate(u.fp, u.got, () => {})); ws.destroy(); if (!res.headersSent) json(res, code, { error: e, next: u.next }); };
+    const abort = () => { r.ups.delete(upid); r.bytes -= u.total; fs.unlink(u.fp, () => {}); };
     req.on('data', ch => { n += ch.length; if (n > len) die(400, 'tamanho'); });
     req.on('close', () => { if (!req.complete) die(400, 'abortado'); });
     ws.on('error', () => die(500, 'disco'));
     ws.on('finish', () => {
       if (dead) return;
       if (n !== len || !r.peers.has(id)) return die(400, 'tamanho');
+      u.got += n; u.next++; u.busy = false; u.t = Date.now();
+      if (u.next < parts) return json(res, 200, { ok: true });
+      if (u.got !== u.total) { abort(); return json(res, 400, { error: 'tamanho' }); }
+      r.ups.delete(upid);
       const mt = clean(q.get('type'), 60).toLowerCase(), mime = INLINE.test(mt) ? mt : 'application/octet-stream';
       const fname = clean(q.get('name'), 100).replace(/[\\/:*?"<>|]/g, '_') || 'arquivo';
-      r.files.set(fid, { name: fname, mime, size: n, p: fp });
+      r.files.set(upid, { name: fname, mime, size: u.total, p: u.fp });
       let re = null; try { const o = JSON.parse(q.get('re') || 'null'); if (o && typeof o === 'object') re = { id: clean(o.id, 16), name: clean(o.name, 24), text: clean(o.text, 80) }; } catch (e) {}
       const mid = clean(q.get('mid'), 16);
-      r.peers.forEach((pc, pid) => { if (pid !== id) push(pc, 'file', { name: c.name, mid, re, file: { name: fname, size: n, mime, u: '/f?room=' + room + '&id=' + pid + '&fid=' + fid + '&s=' + sign(room, fid, pid) } }); });
-      json(res, 200, { ok: true });
+      r.peers.forEach((pc, pid) => { if (pid !== id) push(pc, 'file', { name: c.name, mid, re, file: { name: fname, size: u.total, mime, u: '/f?room=' + room + '&id=' + pid + '&fid=' + upid + '&s=' + sign(room, upid, pid) } }); });
+      json(res, 200, { ok: true, done: true });
     });
     return req.pipe(ws);
   }
@@ -276,6 +311,7 @@ setInterval(() => {
   const now = Date.now();
   rooms.forEach((r, code) => {
     r.peers.forEach((c, id) => { if (!c.res && now - c.seen > GONE_MS) remove(r, id); });
+    r.ups.forEach((u, k) => { if (now - u.t > 1800e3) { r.ups.delete(k); r.bytes -= u.total; fs.unlink(u.fp, () => {}); } });
     if (!r.peers.size && now - r.empty > EMPTY_MS) dropRoom(code);
   });
 }, 10000);
