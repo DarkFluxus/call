@@ -122,6 +122,10 @@ async function turnList() {
   }
   return out;
 }
+const HIST_MAX = 300;
+const histFor = (room, r, pid) => r.hist.map(x => x.k === 'c'
+  ? { e: 'chat', d: { name: x.name, text: x.text, mid: x.mid, re: x.re, t: x.t } }
+  : { e: 'file', d: { name: x.name, mid: x.mid, re: x.re, t: x.t, file: { name: x.f.name, size: x.f.size, mime: x.f.mime, u: '/f?room=' + room + '&id=' + pid + '&fid=' + x.fid + '&s=' + sign(room, x.fid, pid) } } });
 const small = (o, n) => String(o || '').slice(0, n);
 
 /* ---------- servidor ---------- */
@@ -162,7 +166,7 @@ const server = http.createServer({ maxHeaderSize: 8192 }, (req, res) => {
     if (SENHA && !same(h['x-senha'] || '', SENHA)) { strike(ip); return json(res, 403, { error: 'senha' }); }
     if (rooms.size >= MAX_ROOMS) return json(res, 503, { error: 'lotado' });
     let c; do c = newCode(); while (rooms.has(c));
-    rooms.set(c, { peers: new Map(), files: new Map(), ups: new Map(), bytes: 0, empty: Date.now() });
+    rooms.set(c, { peers: new Map(), files: new Map(), ups: new Map(), hist: [], bytes: 0, empty: Date.now() });
     return json(res, 200, { room: c });
   }
 
@@ -209,7 +213,7 @@ const server = http.createServer({ maxHeaderSize: 8192 }, (req, res) => {
     r.peers.set(id, { name, th: sha(k), q: [], res: null, t: null, seen: Date.now(), cr: [] });
     r.empty = 0;
     others(r, id, 'join', { id, name });
-    return json(res, 200, { peers });
+    return json(res, 200, { peers, hist: histFor(room, r, id) });
   }
 
   const a = auth(room, id, k);
@@ -249,7 +253,11 @@ const server = http.createServer({ maxHeaderSize: 8192 }, (req, res) => {
         c.cr.push(now);
         const text = clean(d.text, 500);
         const re = d.re && typeof d.re === 'object' ? { id: clean(d.re.id, 16), name: clean(d.re.name, 24), text: clean(d.re.text, 80) } : null;
-        if (text) others(r, id, 'chat', { name: c.name, text, mid: clean(d.mid, 16), re });
+        if (text) {
+          const mid = clean(d.mid, 16), t = Date.now();
+          r.hist.push({ k: 'c', name: c.name, text, mid, re, t }); if (r.hist.length > HIST_MAX) r.hist.shift();
+          others(r, id, 'chat', { name: c.name, text, mid, re, t });
+        }
       } else if (d.t === 'sig' && typeof d.to === 'string' && d.to !== id && r.peers.has(d.to)) {
         push(r.peers.get(d.to), 'sig', { from: id, d: d.d });
       } else if (d.t === 'share') {
@@ -298,7 +306,9 @@ const server = http.createServer({ maxHeaderSize: 8192 }, (req, res) => {
       r.files.set(upid, { name: fname, mime, size: u.total, p: u.fp });
       let re = null; try { const o = JSON.parse(q.get('re') || 'null'); if (o && typeof o === 'object') re = { id: clean(o.id, 16), name: clean(o.name, 24), text: clean(o.text, 80) }; } catch (e) {}
       const mid = clean(q.get('mid'), 16);
-      r.peers.forEach((pc, pid) => { if (pid !== id) push(pc, 'file', { name: c.name, mid, re, file: { name: fname, size: u.total, mime, u: '/f?room=' + room + '&id=' + pid + '&fid=' + upid + '&s=' + sign(room, upid, pid) } }); });
+      const t = Date.now();
+      r.hist.push({ k: 'f', name: c.name, mid, re, t, fid: upid, f: { name: fname, size: u.total, mime } }); if (r.hist.length > HIST_MAX) r.hist.shift();
+      r.peers.forEach((pc, pid) => { if (pid !== id) push(pc, 'file', { name: c.name, mid, re, t, file: { name: fname, size: u.total, mime, u: '/f?room=' + room + '&id=' + pid + '&fid=' + upid + '&s=' + sign(room, upid, pid) } }); });
       json(res, 200, { ok: true, done: true });
     });
     return req.pipe(ws);

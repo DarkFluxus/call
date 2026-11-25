@@ -62,6 +62,7 @@ aside{display:flex;flex-direction:column;min-height:0;min-width:0;background:var
 #log{flex:1;min-height:0;overflow:auto;padding:10px 12px;display:flex;flex-direction:column;gap:8px;overflow-wrap:anywhere}
 .m{max-width:92%;align-self:flex-start;background:var(--p2);border-radius:14px 14px 14px 4px;padding:7px 11px;position:relative;touch-action:pan-y;transition:transform .15s}
 .m b{color:var(--a)}
+.tm{color:var(--m);font-size:11px;margin-right:6px}
 .m.me{align-self:flex-end;background:#4b3b12;border-radius:14px 14px 4px 14px}
 .m.sys{align-self:center;max-width:100%;background:none;padding:0;text-align:center;color:var(--m);font-size:13px}
 .m.hl{outline:2px solid var(--a)}
@@ -222,24 +223,32 @@ const st=(t,bad)=>{$('#st').textContent=t;$('#st').className=bad?'bad':''};
 const post=b=>{pq=pq.then(()=>fetch('/send?'+qs(),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)}).catch(()=>{}))};
 const tx=(to,d)=>post({t:'sig',to,d});
 const notify=()=>{if(innerWidth<=800&&$('#mn').classList.contains('nochat'))$('#chatbtn').dataset.n=++unread};
+function showFile(d){addMsg(d.name,'','',{id:d.mid,re:d.re,file:d.file,t:d.t});const m=msgs.get(d.mid);if(m)m.text='📎 '+d.file.name}
+function showHist(list,first){ // conversa e arquivos de antes de você entrar (ou que você perdeu enquanto estava desconectado)
+  const novas=(list||[]).filter(x=>!(x.d.mid&&msgs.has(x.d.mid)));
+  if(!novas.length)return;
+  if(first)sys('— conversa de antes de você entrar —');
+  for(const x of novas){if(x.e==='chat')addMsg(x.d.name,x.d.text,'',{id:x.d.mid,re:x.d.re,t:x.d.t});else if(x.e==='file')showFile(x.d)}
+  if(first)sys('— agora —');
+}
 const EV={
   join:d=>{if(peers.has(d.id))drop(d.id);peer(d.id,d.name);people();sys(d.name+' entrou')},
   leave:d=>{const p=peers.get(d.id);if(p){sys(p.name+' saiu');drop(d.id)}people()},
   sig:d=>signal(d.from,d.d),
   share:d=>{const p=peers.get(d.id);if(p){p.sharing=d.on;p.streams.forEach(s=>sync(p,s))}},
-  chat:d=>{addMsg(d.name,d.text,'',{id:d.mid,re:d.re});notify()},
-  file:d=>{addMsg(d.name,'','',{id:d.mid,re:d.re,file:d.file});const m=msgs.get(d.mid);if(m)m.text='📎 '+d.file.name;notify()}
+  chat:d=>{addMsg(d.name,d.text,'',{id:d.mid,re:d.re,t:d.t});notify()},
+  file:d=>{showFile(d);notify()}
 };
 async function connect(first){ // long-polling: funciona em qualquer túnel
   let joined=true;
-  first.peers.forEach(p=>peer(p.id,p.name));people();
+  first.peers.forEach(p=>peer(p.id,p.name));people();showHist(first.hist,true);
   for(;;){
     try{
       if(!joined){
         const e=await enter();
         if(e.retry)throw new Error('rede');
         if(e.err){alert(e.err);location.href=location.pathname;return}
-        await getIce();[...peers.keys()].forEach(i=>drop(i));e.d.peers.forEach(p=>peer(p.id,p.name));people();joined=true;
+        await getIce();[...peers.keys()].forEach(i=>drop(i));e.d.peers.forEach(p=>peer(p.id,p.name));people();showHist(e.d.hist,false);joined=true;
         if(screen)post({t:'share',on:true});
       }
       const r=await fetch('/poll?'+qs(),{cache:'no-store'});
@@ -500,6 +509,7 @@ function addMsg(who,text,cls,o){
     d.append(q);
   }
   if(who){const b=document.createElement('b');b.textContent=who+' ';d.append(b)}
+  if(o.t){const s=document.createElement('small');s.className='tm';s.textContent=new Date(o.t).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});d.append(s)}
   if(text)d.append(text);
   if(o.file)d.append(fileEl(o.file));
   if(o.id){const rb=document.createElement('button');rb.className='rb';rb.textContent='↩';rb.title='Responder';rb.onclick=()=>reply(o.id);d.append(rb);swipe(d,()=>reply(o.id))}
@@ -531,7 +541,7 @@ $('#f').onsubmit=e=>{
   e.preventDefault();
   const i=$('#msg'),t=i.value.trim();if(!t)return;
   const mid=hex(4);
-  post({t:'chat',text:t,mid,re:rep});addMsg('Você',t,'me',{id:mid,re:rep});i.value='';clearRep();
+  post({t:'chat',text:t,mid,re:rep});addMsg('Você',t,'me',{id:mid,re:rep,t:Date.now()});i.value='';clearRep();
 };
 
 /* ---------- imagens, vídeos e arquivos (pelo servidor: chega pra todo mundo, mesmo em 4G) ---------- */
@@ -575,7 +585,7 @@ function sendFiles(list){
   for(const f of list){
     if(!f.size){sys(f.name+': arquivo vazio.');continue}
     if(f.size>max){sys(f.name+': passa de '+Math.round(max/1048576)+' MB.');continue}
-    const mid=hex(4),d=addMsg('Você','','me',{id:mid,re,file:{name:f.name,size:f.size,mime:f.type,url:URL.createObjectURL(f)}});
+    const mid=hex(4),d=addMsg('Você','','me',{id:mid,re,t:Date.now(),file:{name:f.name,size:f.size,mime:f.type,url:URL.createObjectURL(f)}});
     msgs.get(mid).text='📎 '+f.name;
     const pg=document.createElement('div');pg.className='pg';pg.textContent='Enviando… 0%';d.append(pg);
     up=up.then(()=>upload(f,mid,re,pg));
