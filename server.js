@@ -7,7 +7,8 @@
 //   PORT=3000           porta (hospedagem define sozinha)
 //   HOST=127.0.0.1      onde escuta (padrão: só local; vira 0.0.0.0 se a hospedagem definir PORT)
 //   TRUST_PROXY=1       confia no X-Forwarded-For (use em Render/Railway/Fly etc.)
-//   MAX_FILE_MB=200     tamanho máximo de arquivo     ROOM_QUOTA_MB=500  limite por sala    GLOBAL_QUOTA_MB=1500  limite do servidor todo
+//   MAX_FILE_MB=2048    tamanho máximo de arquivo     ROOM_QUOTA_MB=4096 limite por sala    GLOBAL_QUOTA_MB=4096  limite do servidor todo
+//                       (se a hospedagem tiver disco pequeno, diminua esses três; o servidor também recusa upload quando o disco está acabando)
 //   CF_TURN_KEY_ID / CF_TURN_TOKEN     TURN grátis da Cloudflare (faz tela/voz funcionar pra quem está em 4G ou rede restrita)
 //   TURN_URL / TURN_USER / TURN_PASS   ou qualquer outro servidor TURN
 const http = require('http'), fs = require('fs'), path = require('path'), os = require('os'), zlib = require('zlib'), crypto = require('crypto');
@@ -15,7 +16,7 @@ const PORT = +process.env.PORT || 3000;
 const HOST = process.env.HOST || (process.env.PORT ? '0.0.0.0' : '127.0.0.1');
 const SENHA = process.env.SENHA || '', TRUST = process.env.TRUST_PROXY === '1';
 const MAX = 8, POLL_MS = 25000, GONE_MS = 40000, EMPTY_MS = 15 * 60000, MAX_ROOMS = 60, MAX_CLIENTS = 300;
-const MAX_FILE = (+process.env.MAX_FILE_MB || 200) * 1048576, QUOTA = (+process.env.ROOM_QUOTA_MB || 500) * 1048576, GLOBAL = (+process.env.GLOBAL_QUOTA_MB || 1500) * 1048576, CHUNK_MAX = 16 * 1048576;
+const MAX_FILE = (+process.env.MAX_FILE_MB || 2048) * 1048576, QUOTA = (+process.env.ROOM_QUOTA_MB || 4096) * 1048576, GLOBAL = (+process.env.GLOBAL_QUOTA_MB || 4096) * 1048576, CHUNK_MAX = 16 * 1048576, DISK_RESERVE = 300 * 1048576;
 const HTML = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');
 const DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'resenha-'));
 const KEY = crypto.randomBytes(32);
@@ -260,16 +261,17 @@ const server = http.createServer({ maxHeaderSize: 8192 }, (req, res) => {
   }
 
   if (m === 'POST' && p === '/upload') { // arquivo grande vai em pedaços de ~8 MB (proxies/túneis cortam pedidos grandes)
-    if (hit(ip, 'up', 150, 60000)) return json(res, 429, { error: 'devagar' });
+    if (hit(ip, 'up', 600, 60000)) return json(res, 429, { error: 'devagar' });
     const upid = q.get('up') || '', part = +q.get('part'), parts = +q.get('parts'), total = +q.get('size'), len = +h['content-length'];
     if (!FID.test(upid) || !Number.isInteger(part) || !Number.isInteger(parts) || part < 0 || parts < 1 || parts > 400 || part >= parts) return json(res, 400, { error: 'pedido' });
-    if (!(total > 0) || total > MAX_FILE) { res.writeHead(413, { 'Connection': 'close', 'Content-Type': 'application/json' }); return res.end('{"error":"grande"}'); }
+    if (!(total > 0) || total > MAX_FILE) { res.writeHead(413, { 'Content-Type': 'application/json' }); req.resume(); return res.end('{"error":"grande"}'); }
     if (!(len > 0) || len > CHUNK_MAX) return json(res, 400, { error: 'pedaço' });
     let u = r.ups.get(upid);
     if (!u) {
       if (part !== 0 || r.files.has(upid)) return json(res, 404, { error: 'sessão' });
       let g = 0; rooms.forEach(x => g += x.bytes);
-      if (r.bytes + total > QUOTA || g + total > GLOBAL) { res.writeHead(413, { 'Connection': 'close', 'Content-Type': 'application/json' }); return res.end('{"error":"cota"}'); }
+      if (r.bytes + total > QUOTA || g + total > GLOBAL) { res.writeHead(413, { 'Content-Type': 'application/json' }); req.resume(); return res.end('{"error":"cota"}'); }
+      try { const f = fs.statfsSync(DIR); if (f.bavail * f.bsize < total + DISK_RESERVE) { res.writeHead(413, { 'Content-Type': 'application/json' }); req.resume(); return res.end('{"error":"disco"}'); } } catch (e) {} // não deixa encher o disco
       r.bytes += total;
       u = { by: id, total, got: 0, next: 0, fp: path.join(DIR, room + '-' + upid), t: Date.now(), busy: false };
       r.ups.set(upid, u);

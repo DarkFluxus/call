@@ -566,7 +566,7 @@ async function upload(f,mid,re,pg){
       if(!ok&&(r.s===0||r.s===429||r.s>=500))await new Promise(z=>setTimeout(z,1500*(t+1)));
       else if(!ok)break;
     }
-    if(!ok){pg.textContent=r.s===413?'Não enviou: arquivo grande demais ou sala cheia de arquivos.':r.s===429?'Não enviou: muitos envios seguidos, espera um pouco.':'Falhou o envio ('+(r.s||'conexão')+').';return}
+    if(!ok){pg.textContent=r.s===413?(r.d.error==='disco'?'Não enviou: o servidor está sem espaço em disco.':'Não enviou: arquivo grande demais ou sala cheia de arquivos.'):r.s===429?'Não enviou: muitos envios seguidos, espera um pouco.':'Falhou o envio ('+(r.s||'conexão')+').';return}
   }
   pg.remove();
 }
